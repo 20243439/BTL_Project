@@ -7,31 +7,39 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import glob
 import tifffile
+from typing import Tuple, Optional
+import math
 import cv2
 
 from dataset import RingBeamDataset, read_image
 from model import build_model
 
-# ---------------------------
-# Polar utilities (adapted from preprocess.py, minimized)
-# ---------------------------
-def _contour_centroid(img: np.ndarray, threshold: float) -> tuple[float, float, float]:
+def find_robust_circle_center(img: np.ndarray) -> Tuple[float, float, float]:
     h, w = img.shape
-    max_val = float(img.max())
-    if max_val > 0:
-        norm_img = (img / max_val * 255).astype(np.uint8)
-        binary_thresh = int((threshold / max_val) * 255)
-    else:
-        norm_img = img.astype(np.uint8)
-        binary_thresh = 0
-    _, binary = cv2.threshold(norm_img, binary_thresh, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    if cv2 is None:
         return (w - 1) / 2.0, (h - 1) / 2.0, min(w, h) / 2.0
-    main_contour = max(contours, key=cv2.contourArea)
-    (x, y), radius = cv2.minEnclosingCircle(main_contour)
-    return float(x), float(y), float(radius)
 
+    max_val = float(img.max()) if img.size else 0.0
+    norm_img_8u = (img / max_val * 255).astype(np.uint8) if max_val > 0 else img.astype(np.uint8)
+
+    _, binary = cv2.threshold(norm_img_8u, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest_contour) > w * h * 0.01:
+            (x, y), radius = cv2.minEnclosingCircle(largest_contour)
+            return float(x), float(y), float(radius)
+
+    blurred_img = cv2.medianBlur(norm_img_8u, 5)
+    circles = cv2.HoughCircles(
+        blurred_img, cv2.HOUGH_GRADIENT, dp=1.2, minDist=w//2,
+        param1=60, param2=40, minRadius=int(w * 0.1), maxRadius=int(w * 0.5)
+    )
+    if circles is not None:
+        x, y, radius = circles[0, 0]
+        return float(x), float(y), float(radius)
+
+    return (w - 1) / 2.0, (h - 1) / 2.0, min(w, h) / 2.0
 
 def _bilinear_sample(image: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
     h, w = image.shape
@@ -67,7 +75,6 @@ def _polar_resample(img: np.ndarray, cx: float, cy: float, r_bins: int, s_bins: 
     resampled_image = _bilinear_sample(img, ys, xs)
     return resampled_image, rs
 
-
 def main():
     parser = argparse.ArgumentParser(description="Extract features from the beam dataset (with TIFF crop + color).")
     parser.add_argument('--data_dir', type=str, default='dataset', help='Root directory of the dataset.')
@@ -80,11 +87,12 @@ def main():
     parser.add_argument('--stride', type=int, default=128, help='Stride for patch extraction.')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--crop', action='store_true', help='Enable cropping.')
-    parser.add_argument('--crop_x', type=int, default=1550)
-    parser.add_argument('--crop_y', type=int, default=900)
-    parser.add_argument('--crop_w', type=int, default=1024)
-    parser.add_argument('--crop_h', type=int, default=1024)
+
+    parser.add_argument('--crop', action='store_true', help='Enable ROBUST cropping around the detected wafer center.')
+    parser.add_argument('--crop_margin', type=float, default=0.15, help='Margin ratio to add to the detected radius for cropping (e.g., 0.15 for 15%).')
+    parser.add_argument('--use_polar', action='store_true', help='Apply polarization (polar transform) before patching/encoding.')
+    parser.add_argument('--r_bins', type=int, default=512, help='Radial resolution for polar transform.')
+    parser.add_argument('--s_bins', type=int, default=1024, help='Angular resolution for polar transform.')
     parser.add_argument('--threshold', type=float, default=8300.0, help='Sum threshold for filtering dark patches.')
     # Polarization options
     parser.add_argument('--use_polar', action='store_true', help='Apply polarization (polar transform) before patching/encoding.')
@@ -122,7 +130,6 @@ def main():
     encoder = model.encoder.to(device)
     encoder.eval()
 
-    # Save under features/polar/<encoder> when polar is enabled, else features/<encoder>
     features_output_dir = os.path.join(output_dir, 'polar', args.encoder) if args.use_polar else os.path.join(output_dir, args.encoder)
     for name in class_names:
         os.makedirs(os.path.join(features_output_dir, name), exist_ok=True)
@@ -133,8 +140,7 @@ def main():
         root_path=args.data_dir,
         target_size=None,
         classes=class_names,
-        crop=args.crop,
-        crop_coords=(args.crop_x, args.crop_y, args.crop_w, args.crop_h)
+        crop=False,
     )
     data_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers)
 
@@ -147,20 +153,38 @@ def main():
 
             # Retrieve grayscale image (H, W)
             img_full = img_full.squeeze(0).squeeze(0).numpy()
+            if args.crop:
+                if img_full.size == 0:
+                    print(f"[WARN] Skipping empty image: {fname}")
+                    continue
+                cx, cy, r_est = find_robust_circle_center(img_full)
+                box_r = r_est * (1.0 + args.crop_margin)
 
-            # Optional polar transform before color mapping
+                h, w = img_full.shape
+                x0 = int(max(0, cx - box_r))
+                y0 = int(max(0, cy - box_r))
+                x1 = int(min(w, cx + box_r))
+                y1 = int(min(h, cy + box_r))
+
+                img_full = img_full[y0:y1, x0:x1]
+                if img_full.size == 0:
+                    print(f"[WARN] Cropping resulted in an empty image for {fname}. Skipping.")
+                    continue
             if args.use_polar:
                 # Step 1: estimate center and initial radius
-                cx, cy, initial_rmax = _contour_centroid(img_full, args.polar_threshold)
+                cx, cy, initial_rmax = find_robust_circle_center(img_full)
                 # Step 2: coarse polar to find signal region
-                polar_coarse, rs_coarse = _polar_resample(img_full, cx, cy, args.r_bins, args.s_bins, rmin=0.0, rmax=initial_rmax)
+                polar_coarse, rs_coarse, _ = _polar_resample(
+                    img_full, cx, cy, args.r_bins, args.s_bins, rmin=0.0, rmax=initial_rmax
+                )
                 radial_mean_profile = polar_coarse.mean(axis=1)
-                # Heuristic focusing range using ratio of mean
-                signal_threshold = float(radial_mean_profile.mean()) * float(args.signal_ratio)
+                signal_threshold = radial_mean_profile.mean() + radial_mean_profile.std()
                 significant_indices = np.where(radial_mean_profile > signal_threshold)[0]
-                if len(significant_indices) > 0:
-                    r_idx_min = int(significant_indices.min())
-                    r_idx_max = int(significant_indices.max())
+                if len(significant_indices) > 2:
+                    r_idx_min, r_idx_max = significant_indices.min(), significant_indices.max()
+                    padding = int((r_idx_max - r_idx_min) * 0.15)
+                    r_idx_min = max(0, r_idx_min - padding)
+                    r_idx_max = min(len(rs_coarse) - 1, r_idx_max + padding)
                     focused_rmin = float(rs_coarse[r_idx_min])
                     focused_rmax = float(rs_coarse[r_idx_max])
                 else:
@@ -174,10 +198,8 @@ def main():
 
             # Normalize and colorize to RGB for encoders trained on 3-channel images
             img_min, img_max = float(work_img.min()), float(work_img.max())
-            if img_max > img_min:
-                img_norm = (work_img - img_min) / (img_max - img_min)
-            else:
-                img_norm = np.zeros_like(work_img, dtype=np.float32)
+            img_norm = (work_img - img_min) / (img_max - img_min + 1e-8)
+
             img_8bit = (img_norm * 255).astype(np.uint8)
 
             img_color = cv2.applyColorMap(img_8bit, cv2.COLORMAP_JET)
@@ -193,7 +215,7 @@ def main():
                     patch = img_color[i:i+ph, j:j+pw, :]
                     patches.append(patch)
 
-            if len(patches) == 0:
+            if not patches:
                 continue
 
             tensors = [torch.tensor(p, dtype=torch.float32).permute(2, 0, 1) / 255.0 for p in patches]
