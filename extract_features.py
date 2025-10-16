@@ -1,5 +1,6 @@
 import os
 import argparse
+import math
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
@@ -10,7 +11,7 @@ from typing import Tuple, Optional
 import math
 import cv2
 
-from beam_dataset import RingBeamDataset, read_image
+from dataset import RingBeamDataset, read_image
 from model import build_model
 
 def find_robust_circle_center(img: np.ndarray) -> Tuple[float, float, float]:
@@ -93,6 +94,12 @@ def main():
     parser.add_argument('--r_bins', type=int, default=512, help='Radial resolution for polar transform.')
     parser.add_argument('--s_bins', type=int, default=1024, help='Angular resolution for polar transform.')
     parser.add_argument('--threshold', type=float, default=8300.0, help='Sum threshold for filtering dark patches.')
+    # Polarization options
+    parser.add_argument('--use_polar', action='store_true', help='Apply polarization (polar transform) before patching/encoding.')
+    parser.add_argument('--r_bins', type=int, default=512, help='Radial resolution for polar transform.')
+    parser.add_argument('--s_bins', type=int, default=1024, help='Angular resolution for polar transform.')
+    parser.add_argument('--polar_threshold', type=float, default=0.0, help='Threshold used to find ring contour for initial radius.')
+    parser.add_argument('--signal_ratio', type=float, default=0.2, help='Ratio factor for focusing signal region in radius (0~1).')
 
     args = parser.parse_args()
     stride = args.stride if args.stride else args.patch_size
@@ -144,6 +151,7 @@ def main():
             fname = fname[0]
             class_name = class_names[label]
 
+            # Retrieve grayscale image (H, W)
             img_full = img_full.squeeze(0).squeeze(0).numpy()
             if args.crop:
                 if img_full.size == 0:
