@@ -3,14 +3,14 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import confusion_matrix
 import pandas as pd
-
+from tqdm import tqdm
 from utils import AverageMeter, plot_confusion_matrix_image
 
 def run_one_epoch(model, loader, criterion, device):
     model.eval()
     loss_meter, acc_meter = AverageMeter(), AverageMeter()
     all_preds, all_labels = [], []
-
+    pbar = tqdm(loader, desc="[Valid] Batch", unit="batch", leave=False)
     with torch.no_grad():
         for data_items in loader:
             if len(data_items) == 4:  # Patch-based loader
@@ -46,7 +46,8 @@ def run_one_epoch(model, loader, criterion, device):
             acc_meter.update(batch_acc, n)
             all_preds.append(preds.detach().cpu().numpy())
             all_labels.append(y_true.detach().cpu().numpy())
-
+            pbar.set_postfix(step_loss=f"{loss_meter.avg:.4f}", step_acc=f"{acc_meter.avg:.4f}")
+    pbar.close()
     all_preds = np.concatenate(all_preds) if all_preds else np.array([])
     all_labels = np.concatenate(all_labels) if all_labels else np.array([])
     return loss_meter.avg, acc_meter.avg, all_labels, all_preds

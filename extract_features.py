@@ -81,18 +81,17 @@ def main():
     parser.add_argument('--encoder', type=str, default='resnet18',
                         choices=['resnet18', 'resnet50', 'efficientnet_b0', 'mobilenet_v3_small'],
                         help='Encoder model to use for feature extraction.')
-    parser.add_argument('--classes', nargs='+', help='List of class names to process.')
-    parser.add_argument('--patch_size', type=int, default=128, help='Patch size.')
-    parser.add_argument('--stride', type=int, default=128, help='Stride for patch extraction.')
+    parser.add_argument('--classes', nargs='+',default=['Crack', 'Particle', 'ref', '높이', '평탄도'], help='List of class names to process.')
+    parser.add_argument('--patch_size', type=int, default=64, help='Patch size.')
+    parser.add_argument('--stride', type=int, default=64, help='Stride for patch extraction.')
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--num_workers', type=int, default=8)
 
-    parser.add_argument('--crop', action='store_true', help='Enable ROBUST cropping around the detected wafer center.')
+    parser.add_argument('--crop', action='store_true',default=True, help='Enable ROBUST cropping around the detected wafer center.')
     parser.add_argument('--crop_margin', type=float, default=0.15, help='Margin ratio to add to the detected radius for cropping (e.g., 0.15 for 15%).')
-    parser.add_argument('--use_polar', action='store_true', help='Apply polarization (polar transform) before patching/encoding.')
+    parser.add_argument('--use_polar', action='store_true', default=True, help='Apply polarization (polar transform) before patching/encoding.')
     parser.add_argument('--r_bins', type=int, default=512, help='Radial resolution for polar transform.')
     parser.add_argument('--s_bins', type=int, default=1024, help='Angular resolution for polar transform.')
-    parser.add_argument('--threshold', type=float, default=8300.0, help='Sum threshold for filtering dark patches.')
 
     args = parser.parse_args()
     stride = args.stride if args.stride else args.patch_size
@@ -212,9 +211,6 @@ def main():
 
             tensors = [torch.tensor(p, dtype=torch.float32).permute(2, 0, 1) / 255.0 for p in patches]
             batch_tensor = torch.stack(tensors).to(device)
-            patch_sums = batch_tensor.sum(dim=(1, 2, 3))
-            mask = patch_sums >= args.threshold
-            batch_tensor = batch_tensor[mask]
 
             if batch_tensor.shape[0] == 0:
                 print(f"[WARN] All patches filtered out for {fname}")
