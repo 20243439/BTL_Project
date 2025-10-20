@@ -62,7 +62,7 @@ def _bilinear_sample(image: np.ndarray, ys: np.ndarray, xs: np.ndarray) -> np.nd
     return out.astype(np.float32)
 
 
-def _polar_resample(img: np.ndarray, cx: float, cy: float, r_bins: int, s_bins: int, rmin: float = 0.0, rmax: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+def _polar_resample(img: np.ndarray, cx: float, cy: float, r_bins: int, s_bins: int, rmin: float = 0.0, rmax: Optional[float] = None) -> tuple[np.ndarray, np.ndarray]:
     h, w = img.shape
     if rmax is None:
         rmax = float(min(cx, cy, w - 1 - cx, h - 1 - cy))
@@ -76,7 +76,7 @@ def _polar_resample(img: np.ndarray, cx: float, cy: float, r_bins: int, s_bins: 
 
 def main():
     parser = argparse.ArgumentParser(description="Extract features from the beam dataset (with TIFF crop + color).")
-    parser.add_argument('--data_dir', type=str, default='dataset', help='Root directory of the dataset.')
+    parser.add_argument('--data_dir', type=str, default=r'D:\KAIST\prev_v1\dataset', help='Root directory of the dataset.')
     parser.add_argument('--output_dir', type=str, default='features', help='Directory to save the extracted features.')
     parser.add_argument('--encoder', type=str, default='resnet18',
                         choices=['resnet18', 'resnet50', 'efficientnet_b0', 'mobilenet_v3_small'],
@@ -89,10 +89,10 @@ def main():
 
     parser.add_argument('--crop', action='store_true',default=True, help='Enable ROBUST cropping around the detected wafer center.')
     parser.add_argument('--crop_margin', type=float, default=0.15, help='Margin ratio to add to the detected radius for cropping (e.g., 0.15 for 15%).')
-    parser.add_argument('--use_polar', action='store_true', default=True, help='Apply polarization (polar transform) before patching/encoding.')
+    parser.add_argument('--use_polar', action='store_true', default=False, help='Apply polarization (polar transform) before patching/encoding.')
     parser.add_argument('--r_bins', type=int, default=512, help='Radial resolution for polar transform.')
     parser.add_argument('--s_bins', type=int, default=1024, help='Angular resolution for polar transform.')
-
+    parser.add_argument('--threshold', type=float, default=8300.0, help='Sum threshold for filtering dark patches.')
     args = parser.parse_args()
     stride = args.stride if args.stride else args.patch_size
 
@@ -211,6 +211,9 @@ def main():
 
             tensors = [torch.tensor(p, dtype=torch.float32).permute(2, 0, 1) / 255.0 for p in patches]
             batch_tensor = torch.stack(tensors).to(device)
+            patch_sums = batch_tensor.sum(dim=(1, 2, 3))
+            mask = patch_sums >= args.threshold
+            batch_tensor = batch_tensor[mask]
 
             if batch_tensor.shape[0] == 0:
                 print(f"[WARN] All patches filtered out for {fname}")
